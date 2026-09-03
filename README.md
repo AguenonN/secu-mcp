@@ -19,27 +19,6 @@ Il est impossible d'injecter un prompt dans une route réseau absente, un privil
 
 ---
 
-## Architecture
-
-```
-┌─ VM GCP e2-standard-2 · k3s single-node · CNI kube-router ────────────────────┐
-│                                                                              │
-│  ns spire                                                                    │
-│    spire-server   CA racine, trust domain mcp.gcp.lab, SVID 1 h              │
-│    spire-agent    DaemonSet, attestation de nœud k8s_psat                    │
-│                                                                              │
-│  ns mcp-lab                        SPIFFE ID              NetworkPolicy      │
-│    agent-sre  ─────────────┐       …/agent-sre            egress: bridge+DNS │
-│                            │ mTLS                                            │
-│    mcp-obs-bridge  ◀───────┘       …/obs-bridge           détient le token   │
-│         │                                                  Grafana           │
-│    network-config                  …/network-config       lab synthétique    │
-│    rogue                           AUCUN — jamais enregistré dans SPIRE      │
-│         │                                                                    │
-│  ns monitoring                                                               │
-│    prometheus :9090   alertmanager :9093   grafana :3000   checkout-api :8080│
-└──────────────────────────────────────────────────────────────────────────────┘
-```
 
 Deux moitiés sur le même cluster :
 
@@ -213,36 +192,6 @@ attempt 4  tcp 1.1.1.1:443     → BLOCKED: connection refused (egress policy, n
 
 Verrous 2, 2, 1 et 1 : les deux premiers refus sont rendus en process, avant que
 l'appel n'atteigne le transport ; les deux derniers dans le noyau.
-
----
-
-## Limites d'ingénierie
-
-**Course au démarrage des NetworkPolicies.** Les règles iptables sont
-programmées **après** que le pod a reçu son IP. Mesuré sur le cluster : à t+0 s
-un `wget` sort vers Internet, à t+20 s il est refusé. Le verrou d'egress tient
-contre un workload subverti en cours d'exécution — le cas visé — mais pas contre
-un workload qui exfiltre dans sa première seconde. Fermer la fenêtre demande une
-application antérieure au workload : un CNI programmant la policy avant de
-rendre le réseau, ou une passerelle d'egress obligatoire.
-
-**Triage déterministe, aucun LLM branché.** `internal/triage` compose la note
-d'incident par template. Sous egress default-deny, joindre une API externe
-exigerait d'ouvrir une route sortante — exactement la décision de moindre
-privilège que le projet sert à rendre visible. Brancher un modèle (Ollama
-in-cluster, ou une API avec une règle d'egress explicite) ne change rien aux
-verrous : le modèle réécrit la phrase, il ne choisit pas quels outils sont
-appelés.
-
-**Autres périmètres assumés.** Le validateur PromQL est syntaxique, pas un
-parser complet : `prometheus/promql/parser` donnerait un AST correct au prix de
-tirer `prometheus/prometheus`. Le caviardeur reconnaît des formes, ce n'est pas
-un classifieur. `insecure_bootstrap = true` côté agent SPIRE : le lab modélise
-un serveur MCP rogue, pas un plan de contrôle SPIRE compromis. Prometheus tourne
-en `emptyDir`, rétention 2 h, réplique unique. Le mot de passe admin Grafana
-est généré au premier déploiement par `setup-observability.sh` et ne quitte
-jamais le cluster ; il se relit avec `kubectl -n monitoring get secret
-grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d`.
 
 ---
 
