@@ -1,0 +1,98 @@
+# The SRE pipeline: the observability bridge and the on-call agent.
+#
+# Two ServiceAccounts, two identities:
+#
+#   sa-mcp-obs  -> spiffe://mcp.gcp.lab/obs-bridge   (holds the Grafana token)
+#   sa-sre-agent-> spiffe://mcp.gcp.lab/agent-sre    (holds no credential at all)
+#
+# Read that asymmetry as the design, not as a detail. The bridge is the only
+# workload in the cluster that can write to Grafana, and the only one that can
+# reach the monitoring namespace at all (see 70-network-policy-obs.yaml). The
+# agent gets a tool it may call; it never gets a token it could leak, and it
+# has no network path to Grafana even if it somehow obtained one.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa-mcp-obs
+  namespace: mcp-lab
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa-sre-agent
+  namespace: mcp-lab
+---
+# The Grafana credential. Created by deploy/gcp/setup-observability.sh, which
+# asks Grafana for a service-account token scoped to annotation writes — the
+# bridge does not get the admin password.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-api-token
+  namespace: mcp-lab
+type: Opaque
+stringData:
+  token: "placeholder-replaced-by-setup-observability.sh"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-obs-bridge
+  namespace: mcp-lab
+  labels: { app: mcp-obs-bridge }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mcp-obs-bridge }
+  template:
+    metadata:
+      labels: { app: mcp-obs-bridge }
+    spec:
+      serviceAccountName: sa-mcp-obs
+      containers:
+        - name: bridge
+          image: mcp-rogue-lab:local
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/mcp-observability"]
+          env:
+            - { name: LISTEN_ADDR, value: ":8443" }
+            - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///spiffe/api.sock" }
+            # Only the on-call agent may open this socket. Not "any workload
+            # our SPIRE attested" — the one workload named here.
+            - { name: AUTHORIZED_CLIENT_IDS, value: "spiffe://mcp.gcp.lab/agent-sre" }
+            - { name: PROMETHEUS_URL, value: "http://prometheus.monitoring.svc.cluster.local:9090" }
+            - { name: ALERTMANAGER_URL, value: "http://alertmanager.monitoring.svc.cluster.local:9093" }
+            - { name: GRAFANA_URL, value: "http://grafana.monitoring.svc.cluster.local:3000" }
+            # Least privilege on the write: one dashboard, six writes a minute.
+            - { name: ALLOWED_DASHBOARDS, value: "api-gateway" }
+            - { name: ANNOTATIONS_PER_MINUTE, value: "6" }
+            - name: GRAFANA_API_KEY
+              valueFrom:
+                secretKeyRef: { name: grafana-api-token, key: token }
+          ports:
+            - containerPort: 8443
+          # The bridge only listens once SPIRE has handed it an SVID, so a TCP
+          # probe doubles as an "identity received" check.
+          readinessProbe:
+            tcpSocket: { port: 8443 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { cpu: 300m, memory: 256Mi }
+          volumeMounts:
+            - { name: spiffe, mountPath: /spiffe, readOnly: true }
+      volumes:
+        - name: spiffe
+          hostPath:
+            path: /run/spire/sockets
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-obs-bridge
+  namespace: mcp-lab
+spec:
+  selector: { app: mcp-obs-bridge }
+  ports: [{ port: 8443, targetPort: 8443 }]

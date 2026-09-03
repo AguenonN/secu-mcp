@@ -1,0 +1,160 @@
+# SPIRE agent — DaemonSet, one per node (a single one on this lab's k3s).
+#
+# Workload attestation moves from the docker attestor (compose lab) to the k8s
+# attestor: the agent asks the kubelet which pod is behind the calling PID and
+# derives selectors such as k8s:ns:mcp-lab and k8s:sa:sa-legit. Registration
+# entries then map ServiceAccounts to SPIFFE IDs — sa-legit and sa-agent get
+# one, sa-rogue deliberately never does.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-agent
+  namespace: spire
+---
+# The k8s workload attestor queries the kubelet (nodes/proxy) to map the
+# calling PID to a pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-agent
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "nodes/proxy"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spire-agent
+subjects:
+  - kind: ServiceAccount
+    name: spire-agent
+    namespace: spire
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-agent-conf
+  namespace: spire
+data:
+  agent.conf: |
+    agent {
+        data_dir       = "/run/spire"
+        log_level      = "INFO"
+        server_address = "spire-server.spire.svc.cluster.local"
+        server_port    = "8081"
+        trust_domain   = "mcp.gcp.lab"
+
+        # Workload API socket, published on the node via hostPath so lab pods
+        # can mount it. Matches SPIFFE_ENDPOINT_SOCKET=unix:///spiffe/api.sock
+        # (the pods mount /run/spire/sockets at /spiffe).
+        socket_path = "/run/spire/sockets/api.sock"
+
+        # SCOPE: same note as the compose lab — this lab models a rogue MCP
+        # server, not a compromised SPIRE control plane. Trust-on-first-contact
+        # with the in-cluster server; harden with trust_bundle_path if needed.
+        insecure_bootstrap = true
+    }
+
+    plugins {
+        # Node attestation: projected ServiceAccount token (audience
+        # spire-server) proves this agent runs as spire:spire-agent on this
+        # node. Replaces the compose lab's join_token.
+        NodeAttestor "k8s_psat" {
+            plugin_data {
+                cluster    = "mcp-gcp-lab"
+                token_path = "/var/run/secrets/tokens/spire-agent"
+            }
+        }
+
+        KeyManager "memory" {
+            plugin_data {}
+        }
+
+        # Workload attestation via the kubelet: caller PID -> pod -> selectors
+        # (k8s:ns:..., k8s:sa:...). The rogue pod is visible here too, but no
+        # registration entry maps to sa-rogue — so it gets nothing.
+        WorkloadAttestor "k8s" {
+            plugin_data {
+                skip_kubelet_verification = true
+            }
+        }
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spire-agent
+  namespace: spire
+  labels:
+    app: spire-agent
+spec:
+  selector:
+    matchLabels:
+      app: spire-agent
+  template:
+    metadata:
+      labels:
+        app: spire-agent
+    spec:
+      serviceAccountName: spire-agent
+      # hostPID: the Workload API resolves callers by their host PID.
+      # hostNetwork: reach the kubelet on the node address.
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: spire-agent
+          image: ghcr.io/spiffe/spire-agent:1.15.3
+          command: ["/opt/spire/bin/spire-agent"]
+          args: ["run", "-config", "/opt/spire/conf/agent.conf"]
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: conf
+              mountPath: /opt/spire/conf
+              readOnly: true
+            - name: sockets
+              mountPath: /run/spire/sockets
+            - name: spire-token
+              mountPath: /var/run/secrets/tokens
+          livenessProbe:
+            exec:
+              command:
+                - /opt/spire/bin/spire-agent
+                - healthcheck
+                - -socketPath
+                - /run/spire/sockets/api.sock
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - /opt/spire/bin/spire-agent
+                - healthcheck
+                - -socketPath
+                - /run/spire/sockets/api.sock
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: conf
+          configMap:
+            name: spire-agent-conf
+        - name: sockets
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: spire-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: spire-agent
+                  audience: spire-server
+                  expirationSeconds: 7200

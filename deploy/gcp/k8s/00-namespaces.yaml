@@ -1,0 +1,10 @@
+# Two namespaces: the identity plane (spire) and the lab workloads (mcp-lab).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spire
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-lab

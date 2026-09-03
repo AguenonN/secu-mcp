@@ -1,0 +1,239 @@
+# Egress confinement for the SRE pipeline.
+#
+# The shape to notice: the on-call agent has NO network path to Grafana,
+# Prometheus or the Internet. It can open exactly one socket — the bridge —
+# and the bridge is what holds the credential. So the blast radius of a fully
+# compromised agent is "it can ask the bridge for things the bridge already
+# validates", which is a far smaller sentence than "it can write to
+# production dashboards".
+#
+# That property is enforced by the kernel, not by anything the model can be
+# talked out of. When cmd/agent-sre runs with SIMULATE_COMPROMISE=on and tries
+# to POST the telemetry it just read to the address named in the alert text,
+# this is the rule that makes it fail.
+#
+# Enforcement: k3s ships kube-router, which enforces NetworkPolicy natively.
+# On a CNI that does not, these objects are accepted and silently ignored —
+# verify with a probe pod before trusting them.
+#
+# MEASURED LIMITATION — a startup race. The policy rules are programmed into
+# iptables asynchronously, shortly AFTER a pod receives its IP, so there is a
+# window of a few seconds at pod start during which egress is not yet filtered.
+# Measured on this cluster with a probe pod labelled app=agent-sre:
+#
+#   t+0s   wget http://1.1.1.1/  -> reached the Internet
+#   t+20s  wget http://1.1.1.1/  -> connection refused
+#   t+20s  tcp 1.1.1.1:443       -> connection refused
+#
+# So this lock holds against a workload that is subverted while running — the
+# case it is built for, and the one the compromise scenario exercises — but
+# NOT against one that exfiltrates in its first second of life. Closing that
+# window needs enforcement that exists before the workload does: a CNI that
+# programs policy before releasing the pod's network, or an egress gateway /
+# sidecar-less mesh the pod must traverse regardless of timing. Named here
+# rather than papered over.
+
+# ---------------------------------------------------------------------------
+# monitoring namespace
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: monitoring
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: monitoring
+spec:
+  # Every pod here resolves cluster names; nothing here resolves anything else,
+  # because the only DNS server allowed is the cluster's own.
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels: { app: prometheus }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Queried by Grafana (datasource) and by the bridge (query_metrics).
+    - from:
+        - podSelector:
+            matchLabels: { app: grafana }
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: mcp-lab }
+          podSelector:
+            matchLabels: { app: mcp-obs-bridge }
+      ports: [{ protocol: TCP, port: 9090 }]
+  egress:
+    # Scrapes the target, pushes alerts. Nothing else — a Prometheus that can
+    # reach the Internet is a remote-write exfiltration channel waiting for a
+    # config change.
+    - to:
+        - podSelector:
+            matchLabels: { app: checkout-api }
+      ports: [{ protocol: TCP, port: 8080 }]
+    - to:
+        - podSelector:
+            matchLabels: { app: alertmanager }
+      ports: [{ protocol: TCP, port: 9093 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels: { app: alertmanager }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: prometheus }
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: mcp-lab }
+          podSelector:
+            matchLabels: { app: mcp-obs-bridge }
+      ports: [{ protocol: TCP, port: 9093 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels: { app: grafana }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # The bridge writes annotations. The node IP block is what lets a human
+    # reach the UI through `kubectl port-forward`, whose traffic originates on
+    # the node — without it the dashboards would be unviewable.
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: mcp-lab }
+          podSelector:
+            matchLabels: { app: mcp-obs-bridge }
+        - ipBlock: { cidr: 10.132.0.0/16 }
+      ports: [{ protocol: TCP, port: 3000 }]
+  egress:
+    # Its datasource, and nothing else: no plugin catalogue, no update check,
+    # no news feed.
+    - to:
+        - podSelector:
+            matchLabels: { app: prometheus }
+      ports: [{ protocol: TCP, port: 9090 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: checkout-api
+  namespace: monitoring
+spec:
+  # Scraped by Prometheus, talks to nobody. The failing service is also the
+  # least trusted thing in the namespace; it gets no egress at all.
+  podSelector:
+    matchLabels: { app: checkout-api }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: prometheus }
+      ports: [{ protocol: TCP, port: 8080 }]
+---
+# ---------------------------------------------------------------------------
+# mcp-lab namespace — the SRE pipeline
+# (default-deny-all for this namespace already exists in 40-network-policy.yaml)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sre-agent-egress-least-privilege
+  namespace: mcp-lab
+spec:
+  podSelector:
+    matchLabels: { app: agent-sre }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The bridge. That is the complete list: no Grafana, no Prometheus, no
+    # Internet. A compromised agent can ask the bridge for things; it cannot
+    # go around it.
+    - to:
+        - podSelector:
+            matchLabels: { app: mcp-obs-bridge }
+      ports: [{ protocol: TCP, port: 8443 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: obs-bridge
+  namespace: mcp-lab
+spec:
+  podSelector:
+    matchLabels: { app: mcp-obs-bridge }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Only the on-call agent, and only on the MCP port. This mirrors, at the
+    # network layer, what AUTHORIZED_CLIENT_IDS enforces at the identity
+    # layer: two independent locks on the same door.
+    - from:
+        - podSelector:
+            matchLabels: { app: agent-sre }
+      ports: [{ protocol: TCP, port: 8443 }]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The three backends it fronts. Note what is missing: any route off the
+    # cluster. The workload holding the Grafana token cannot send it anywhere.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+          podSelector:
+            matchLabels: { app: prometheus }
+      ports: [{ protocol: TCP, port: 9090 }]
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+          podSelector:
+            matchLabels: { app: alertmanager }
+      ports: [{ protocol: TCP, port: 9093 }]
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+          podSelector:
+            matchLabels: { app: grafana }
+      ports: [{ protocol: TCP, port: 3000 }]

@@ -1,0 +1,93 @@
+# Egress confinement — the blast-radius lock that holds even when every
+# textual defence has been fooled.
+#
+# Threat: the injection lands, the model is convinced, the agent decides to
+# exfiltrate what it read towards https://evil.example. These policies make
+# that decision inconsequential: the kernel drops the packets. The curl fails
+# at TCP time; the attacker receives nothing. Same story for the rogue pod
+# itself: it may capture requests into stolen.log, but that loot cannot leave
+# the node.
+#
+# Model: default-deny everything, then re-open ONLY the flows the lab needs:
+#
+#   agent  -> kube-dns:53                  (resolve *.svc.cluster.local)
+#   agent  -> network-config:8443, rogue:8443   (the MCP calls under study)
+#   agent <-  nothing
+#   rogue  -> NOTHING AT ALL              (no DNS, no Internet: loot stays put)
+#   legit  -> NOTHING AT ALL              (SPIRE talks over a unix socket)
+#
+# Enforcement note: k3s ships kube-router, which enforces NetworkPolicy out
+# of the box. On a CNI that does not (e.g. plain kind), these objects are
+# accepted and silently IGNORED — always verify with a probe pod before
+# trusting the lock.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: mcp-lab
+spec:
+  # Every pod in the namespace, both directions, no allow rules: the stance
+  # from which everything below is an explicit, minimal exception.
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-egress-least-privilege
+  namespace: mcp-lab
+spec:
+  podSelector:
+    matchLabels:
+      app: agent
+  policyTypes: [Egress]
+  egress:
+    # DNS, and only towards the cluster resolver — an exfiltration channel
+    # via arbitrary external resolvers stays closed.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The two MCP servers on their service port. The rogue stays reachable on
+    # purpose: the naive scenario must still demonstrate the robbery — the
+    # point of this lock is that NOTHING ELSE is reachable, evil.example
+    # included.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: network-config
+        - podSelector:
+            matchLabels:
+              app: rogue
+      ports:
+        - { protocol: TCP, port: 8443 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-servers-accept-agent-only
+  namespace: mcp-lab
+spec:
+  # Both servers answer the agent and nobody else. Note what is ABSENT for
+  # them: any egress rule. The legitimate server needs none (SPIRE is a unix
+  # socket, its file is a local mount) — and the rogue, having captured its
+  # stolen.log, finds every outbound path closed. Captured is not exfiltrated.
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [network-config, rogue]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: agent
+      ports:
+        - { protocol: TCP, port: 8443 }

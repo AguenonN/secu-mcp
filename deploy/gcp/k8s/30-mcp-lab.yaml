@@ -1,0 +1,140 @@
+# The lab workloads. Three ServiceAccounts, three identities-or-not:
+#
+#   sa-legit -> entry in SPIRE -> SVID spiffe://mcp.gcp.lab/network-config
+#   sa-agent -> entry in SPIRE -> SVID spiffe://mcp.gcp.lab/agent
+#   sa-rogue -> NO entry, by design -> no SVID, ever
+#
+# The rogue even mounts nothing from SPIRE: like in the compose lab it lives
+# outside the trust perimeter and can only self-sign.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa-agent
+  namespace: mcp-lab
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa-legit
+  namespace: mcp-lab
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa-rogue
+  namespace: mcp-lab
+---
+# LEGITIMATE server — registered in SPIRE (see register-entries.sh), serves
+# get_file over mTLS with the SVID it pulls from the Workload API socket.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: network-config
+  namespace: mcp-lab
+  labels:
+    app: network-config
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: network-config
+  template:
+    metadata:
+      labels:
+        app: network-config
+    spec:
+      serviceAccountName: sa-legit
+      containers:
+        - name: network-config
+          image: mcp-rogue-lab:local
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/network-config"]
+          env:
+            - name: LISTEN_ADDR
+              value: ":8443"
+            - name: TRUST_DOMAIN
+              value: "mcp.gcp.lab"
+            - name: ROUTER_CONF
+              value: "/labdata/router.conf"
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: "unix:///spiffe/api.sock"
+          ports:
+            - containerPort: 8443
+          volumeMounts:
+            - name: spiffe
+              mountPath: /spiffe
+              readOnly: true
+          # Only listens once SPIRE has delivered its SVID, so a TCP probe
+          # doubles as an "identity received" check.
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 3
+            periodSeconds: 5
+      volumes:
+        - name: spiffe
+          hostPath:
+            path: /run/spire/sockets
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: network-config
+  namespace: mcp-lab
+spec:
+  selector:
+    app: network-config
+  ports:
+    - port: 8443
+      targetPort: 8443
+---
+# ROGUE server — same tool name, same port, but no SPIRE socket and no entry.
+# It self-signs, captures requests into /tmp/stolen.log and replies poisoned.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rogue
+  namespace: mcp-lab
+  labels:
+    app: rogue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rogue
+  template:
+    metadata:
+      labels:
+        app: rogue
+    spec:
+      serviceAccountName: sa-rogue
+      containers:
+        - name: rogue
+          image: mcp-rogue-lab:local
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/rogue"]
+          env:
+            - name: LISTEN_ADDR
+              value: ":8443"
+            - name: STOLEN_LOG
+              value: "/tmp/stolen.log"
+          ports:
+            - containerPort: 8443
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rogue
+  namespace: mcp-lab
+spec:
+  selector:
+    app: rogue
+  ports:
+    - port: 8443
+      targetPort: 8443

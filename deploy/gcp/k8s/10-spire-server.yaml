@@ -1,0 +1,161 @@
+# SPIRE server — root of trust for the lab. Trust domain mcp.gcp.lab.
+#
+# Node attestation moves from join_token (docker-compose lab) to k8s_psat:
+# the SPIRE agent proves who it is with a projected ServiceAccount token that
+# the server verifies against the Kubernetes API (TokenReview). No shared
+# secret, no manual token step — the cluster itself is the attestation root.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-server
+  namespace: spire
+---
+# PSAT validation: the server reviews the agent token (auth-delegator) and
+# reads the agent pod + node to build the node selectors.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-server-tokenreview
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: spire
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-server-psat
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-server-psat
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spire-server-psat
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: spire
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-server-conf
+  namespace: spire
+data:
+  server.conf: |
+    server {
+        bind_address = "0.0.0.0"
+        bind_port    = "8081"
+        socket_path  = "/tmp/spire-server/private/api.sock"
+        trust_domain = "mcp.gcp.lab"
+        data_dir     = "/run/spire/data"
+        log_level    = "INFO"
+        ca_ttl       = "24h"
+        default_x509_svid_ttl = "1h"
+    }
+
+    plugins {
+        DataStore "sql" {
+            plugin_data {
+                database_type     = "sqlite3"
+                connection_string = "/run/spire/data/datastore.sqlite3"
+            }
+        }
+
+        # The SPIRE agent attests with a projected ServiceAccount token
+        # (audience spire-server). Only spire:spire-agent may attest a node.
+        NodeAttestor "k8s_psat" {
+            plugin_data {
+                clusters = {
+                    "mcp-gcp-lab" = {
+                        service_account_allow_list = ["spire:spire-agent"]
+                    }
+                }
+            }
+        }
+
+        KeyManager "disk" {
+            plugin_data {
+                keys_path = "/run/spire/data/keys.json"
+            }
+        }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server
+  namespace: spire
+spec:
+  selector:
+    app: spire-server
+  ports:
+    - name: grpc
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-server
+  namespace: spire
+  labels:
+    app: spire-server
+spec:
+  serviceName: spire-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spire-server
+  template:
+    metadata:
+      labels:
+        app: spire-server
+    spec:
+      serviceAccountName: spire-server
+      containers:
+        - name: spire-server
+          image: ghcr.io/spiffe/spire-server:1.15.3
+          command: ["/opt/spire/bin/spire-server"]
+          args: ["run", "-config", "/opt/spire/conf/server.conf"]
+          ports:
+            - containerPort: 8081
+          volumeMounts:
+            - name: conf
+              mountPath: /opt/spire/conf
+              readOnly: true
+            - name: data
+              mountPath: /run/spire/data
+          livenessProbe:
+            exec:
+              command: ["/opt/spire/bin/spire-server", "healthcheck"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["/opt/spire/bin/spire-server", "healthcheck", "--shallow"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: conf
+          configMap:
+            name: spire-server-conf
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

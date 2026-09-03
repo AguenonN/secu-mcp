@@ -1,0 +1,121 @@
+# Lab topology. SPIRE issues identity; the legit server gets one, the rogue does
+# not. Bootstrap order matters and is handled for you by the Makefile:
+#
+#   make lab-up        -> starts ONLY spire-server (waits until healthy)
+#   make lab-register  -> generates the agent join token, writes it to the
+#                         shared bootstrap mount, creates registration entries
+#                         (legit + agent, NEVER the rogue), then starts the
+#                         spire-agent and both MCP servers.
+#   make lab-*-rogue / lab-zerotrust-legit -> run the agent on demand.
+#
+# Pinned to SPIRE v1.15.3 and golang:1.25 (the MCP go-sdk requires Go >= 1.25).
+
+x-spiffe-socket: &spiffe-socket
+  SPIFFE_ENDPOINT_SOCKET: unix:///spiffe/api.sock
+
+# Every lab container lives on an internal network: containers reach each
+# other, but the kernel routes NOTHING to the outside world. This is the
+# compose-side blast-radius lock — even if the agent is fooled into
+# exfiltrating towards evil.example, or the rogue tries to phone home with
+# its stolen.log, the packets die at TCP time. (Images are pulled/built by
+# the host before containers start, so the lab needs no runtime egress.)
+x-labnet: &labnet
+  networks: [labnet]
+
+services:
+  spire-server:
+    <<: *labnet
+    image: ghcr.io/spiffe/spire-server:1.15.3
+    # The image runs as uid 1000, but /opt/spire/data does not exist in it, so
+    # Docker creates the named volume root-owned 0755 and the SQLite datastore
+    # cannot be created ("unable to open database file"). The distroless image
+    # has no shell to chown it from, and the spire-agent image already runs as
+    # root, so the lab runs the server as root too.
+    user: "0:0"
+    entrypoint: ["/opt/spire/bin/spire-server"]
+    command: ["run", "-config", "/opt/spire/conf/server.conf"]
+    volumes:
+      - ./spire/server.conf:/opt/spire/conf/server.conf:ro
+      - spire-server-data:/opt/spire/data
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  spire-agent:
+    <<: *labnet
+    image: ghcr.io/spiffe/spire-agent:1.15.3
+    entrypoint: ["/opt/spire/bin/spire-agent"]
+    command: ["run", "-config", "/opt/spire/conf/agent.conf"]
+    pid: host                          # docker attestor maps peer PIDs to containers
+    profiles: ["agent"]                # not started by `up`; started by register step
+    depends_on:
+      spire-server:
+        condition: service_healthy
+    volumes:
+      - ./spire/agent.conf:/opt/spire/conf/agent.conf:ro
+      - ./spire/bootstrap:/run/spire/bootstrap:ro   # holds agent-token
+      - spiffe-workload:/spiffe                      # publishes the Workload API socket
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # LEGITIMATE server — registered in SPIRE, so it receives an SVID.
+  network-config:
+    <<: *labnet
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    entrypoint: ["/usr/local/bin/network-config"]
+    profiles: ["agent"]
+    environment:
+      <<: *spiffe-socket
+      LISTEN_ADDR: ":8443"
+      TRUST_DOMAIN: "mcp.lab"
+      ROUTER_CONF: "/labdata/router.conf"
+    labels:
+      mcp-lab-workload: "network-config"   # -> docker:label:mcp-lab-workload:network-config
+    depends_on: [spire-agent]
+    volumes:
+      - spiffe-workload:/spiffe:ro
+
+  # ROGUE server — deliberately NOT registered in SPIRE and given no Workload
+  # API socket. It never gets an SVID; it can only self-sign.
+  rogue:
+    <<: *labnet
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    entrypoint: ["/usr/local/bin/rogue"]
+    profiles: ["agent"]
+    environment:
+      LISTEN_ADDR: ":8443"
+      STOLEN_LOG: "/tmp/stolen.log"
+    labels:
+      mcp-lab-workload: "rogue"            # label present, but no entry maps to it
+    depends_on: [spire-agent]
+
+  # The agent is run on demand (see Makefile lab-* targets), not as a service.
+  agent:
+    <<: *labnet
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    entrypoint: ["/usr/local/bin/agent"]
+    profiles: ["manual"]
+    environment:
+      <<: *spiffe-socket
+      TRUST_MODE: "naive"
+      MCP_ENDPOINT: "https://network-config:8443"
+      MCP_EXPECTED_ID: "spiffe://mcp.lab/network-config"
+    labels:
+      mcp-lab-workload: "agent"            # -> docker:label:mcp-lab-workload:agent
+    volumes:
+      - spiffe-workload:/spiffe:ro
+
+volumes:
+  spire-server-data:
+  spiffe-workload:
+
+networks:
+  labnet:
+    internal: true   # no default route out: egress confinement at the kernel
